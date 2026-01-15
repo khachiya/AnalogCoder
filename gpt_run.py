@@ -32,13 +32,20 @@ parser.add_argument("--no_context", action="store_true", default=False)
 parser.add_argument("--no_chain", action="store_true", default=False)
 parser.add_argument("--retrieval", action="store_true", default=True)
 parser.add_argument('--api_key', type=str)
+parser.add_argument('--base_url', type=str, default="http://127.0.0.1:1234/v1")
+parser.add_argument("--no_think", action="store_true", default=False) # adds /no_think to the system prompt
+parser.add_argument("--timeout", type=int, default=10) # Timeout for each task in seconds
 
 args = parser.parse_args()
 
-opensource_models = ["mistral", "wizardcoder", "deepseek-coder:33b-instruct", "codeqwen", "mixtral", "qwen"]
+# ollama models
+opensource_models = ["mistral", "wizardcoder", "deepseek-coder:33b-instruct", "codeqwen", "mixtral", "codellama", "codegemma"]
+isOllama = False
 
 if any([model in args.model for model in opensource_models]):
     import ollama
+    isOllama = True
+
 if args.skill:
     args.num_of_retry = min(2, args.num_of_retry)
 
@@ -99,12 +106,10 @@ circuit.SinusoidalVoltageSource('sin', 'Vin', circuit.gnd,
 global client
 
 
-if "gpt" in args.model:
-    client = OpenAI(api_key=args.api_key)
-elif "deepseek-chat" in args.model:
-    client = OpenAI(api_key=args.api_key, base_url="https://api.deepseek.com/v1")
-else:
+if isOllama:
     client = None
+else:
+    client = OpenAI(api_key=args.api_key, base_url=args.base_url, timeout=args.timeout)
 
 
 # This function extracts the code from the generated content which in markdown format
@@ -192,7 +197,7 @@ def run_code(file):
                 execution_error = 0
             if execution_error_info == "" and execution_error == 1:
                 execution_error_info = "Simulation failed."
-        code_content = open(file, "r").read()
+        code_content = open(file, "r", encoding='utf-8').read()
         if "circuit.X" in code_content:
             execution_error_info += "\nPlease avoid using the subcircuit (X) in the code."
         if "error" in result.stdout.lower() and not "<<NAN, error".lower() in result.stdout.lower() and simulation_error == 0:
@@ -689,20 +694,60 @@ def write_pyspice_code(sp_code_path, code_path, op_path):
     code.write(pyspice_template.replace("[OP_PATH]", op_path))
     code.close()
 
+# グローバルにプロセスを保持
+ollama_process = None
+
+def start_ollama_session(command):
+    global ollama_process
+    # すでに起動していれば何もしない（必要に応じて）
+    if ollama_process is not None and ollama_process.poll() is None:
+        print("Ollama process is already running.")
+        return
+
+    # バックグラウンドで起動
+    ollama_process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP  # WindowsでCTRL+Cを送れるようにする
+    )
+    print(f"Ollama session started, running command: {command}")
+
+def kill_ollama_session():
+    global ollama_process
+    if ollama_process is not None and ollama_process.poll() is None:
+        # Windowsで安全に kill する
+        ollama_process.send_signal(signal.CTRL_BREAK_EVENT)
+        try:
+            ollama_process.wait(timeout=10)
+            print("Ollama session has been killed successfully.")
+        except subprocess.TimeoutExpired:
+            ollama_process.kill()
+            print("Ollama session forcibly killed after timeout.")
+        ollama_process = None
+    else:
+        print("No Ollama session to kill.")
 
 def start_tmux_session(session_name, command):
-    subprocess.run(['tmux', 'new-session', '-d', '-s', session_name])
-    subprocess.run(['tmux', 'send-keys', '-t', session_name, command, 'C-m'])
-    print(f"tmux session '{session_name}' started, running command: {command}")
-
+    #subprocess.run(['tmux', 'new-session', '-d', '-s', session_name])
+    #subprocess.run(['tmux', 'send-keys', '-t', session_name, command, 'C-m'])
+    #print(f"tmux session '{session_name}' started, running command: {command}")
+    start_ollama_session("ollama serve")
 
 def kill_tmux_session(session_name):
-    try:
-        subprocess.run(['tmux', 'kill-session', '-t', session_name], check=True)
-        print(f"tmux session '{session_name}' has been killed successfully.")
-    except subprocess.CalledProcessError:
-        print(f"Failed to kill tmux session '{session_name}'. Session might not exist.")
+    #try:
+    #    subprocess.run(['tmux', 'kill-session', '-t', session_name], check=True)
+    #    print(f"tmux session '{session_name}' has been killed successfully.")
+    #except subprocess.CalledProcessError:
+    #    print(f"Failed to kill tmux session '{session_name}'. Session might not exist.")
+    kill_ollama_session()    
 
+import threading
+
+def timeout_handler():
+    print("timeout")
+    # ollama を再起動する処理を追加（Windows 用に要調整）
 
 def work(task, input, output, task_id, it, background, task_type, flog, 
             money_quota = 100, subcircuits = None):
@@ -769,8 +814,12 @@ def work(task, input, output, task_id, it, background, task_type, flog,
     prompt_sim_error = fopen_sim_error.read()
     fopen_sim_error.close()
 
+    system_prompt = "You are an analog integrated circuits expert."
+    if args.no_think:
+        system_prompt += "/no_think"
+
     messages = [
-            {"role": "system", "content": "You are an analog integrated circuits expert."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
             ]
     retry = True
@@ -780,10 +829,13 @@ def work(task, input, output, task_id, it, background, task_type, flog,
         return money_quota
 
     while retry:
-        if any(model in args.model for model in opensource_models):
+        if isOllama:
             print(f"start {args.model} completion")
-            signal.signal(signal.SIGALRM, signal_handler)
-            signal.alarm(360)
+            #signal.signal(signal.SIGABRT, signal_handler)
+            #signal.alarm(360)
+            # タイマー開始
+            timer = threading.Timer(360, timeout_handler)
+            timer.start()
             try:
                 completion = ollama.chat(
                     model=args.model,
@@ -794,12 +846,15 @@ def work(task, input, output, task_id, it, background, task_type, flog,
                         # "num_predict": 16192,
                     })
                 print(f"{args.model} completion finish")
-                signal.alarm(0)
+                #signal.alarm(0)
+                timer.cancel()
                 break
             except TimeoutException as e:
+            #except ollama.ResponseError as e:
                 print(e)
                 print("timeout")
-                signal.alarm(0)
+                #signal.alarm(0)
+                timer.cancel()
                 print("restart ollama")
                 kill_tmux_session("ollama")
                 result = subprocess.run(['ollama', 'restart'], capture_output=True, text=True)
@@ -813,6 +868,8 @@ def work(task, input, output, task_id, it, background, task_type, flog,
                     temperature = args.temperature
                 )
                 break
+            except json.JSONDecodeError as e:
+                print("Failed to decode JSON due to:", e)
             except openai.APIStatusError as e:
                 print("Encountered an APIStatusError. Details:")
                 print(e)
@@ -832,7 +889,7 @@ def work(task, input, output, task_id, it, background, task_type, flog,
     elif "gpt-4" in args.model:
         money_quota -= (completion.usage.prompt_tokens / 1e6 * 10) + (completion.usage.completion_tokens / 1e6 * 30)
 
-    if "gpt" in args.model or "deepseek-chat" in args.model:
+    if not isOllama:
         answer = completion.choices[0].message.content
     else:
         answer = completion['message']['content']
@@ -852,11 +909,8 @@ def work(task, input, output, task_id, it, background, task_type, flog,
         model_dir = 'gpt4'
     elif "deepseek-chat" in args.model:
         model_dir = "deepseek2"
-    elif any(model in args.model for model in opensource_models):
-        model_dir = str(args.model).replace(":", "-")
     else:
-        model_dir = 'unknown'
-    
+        model_dir = str(args.model).replace(":", "-").replace("/", "-")
 
     if "ft-A" in model_dir:
         assert task_id in [0, 3, 6, 9, 14, 10, 11]
@@ -879,6 +933,9 @@ def work(task, input, output, task_id, it, background, task_type, flog,
     
     if task_type in complex_task_type and not args.skill:
         model_dir += "_no_skill"
+
+    if args.no_think:
+        model_dir += "_nothink"
     
     if not os.path.exists(model_dir):
         try:
@@ -920,7 +977,7 @@ def work(task, input, output, task_id, it, background, task_type, flog,
     fwrite_input = open('{}/p{}/p{}_{}_input.txt'.format(model_dir, task_id, task_id, it), 'w')
     fwrite_input.write(prompt)
     fwrite_input.flush()
-    fwrite_output = open('{}/p{}/p{}_{}_output.txt'.format(model_dir, task_id, task_id, it), 'w')
+    fwrite_output = open('{}/p{}/p{}_{}_output.txt'.format(model_dir, task_id, task_id, it), 'w', encoding='utf-8')
     fwrite_output.write(answer)
     fwrite_output.flush()
     
@@ -957,7 +1014,7 @@ def work(task, input, output, task_id, it, background, task_type, flog,
         code_path = '{}/p{}/{}/p{}_{}_{}.py'.format(model_dir, task_id, it, task_id, it, code_id)
         if args.ngspice:
             code_path = code_path.replace(".py", ".sp")
-        fwrite_code = open(code_path, 'w')
+        fwrite_code = open(code_path, 'w', encoding="utf-8")
         fwrite_code.write(code)
         fwrite_code.close()
 
@@ -984,7 +1041,7 @@ def work(task, input, output, task_id, it, background, task_type, flog,
                 _, code_netlist = None, answer_code
                 code_netlist += output_netlist_template
                 code_netlist_path = "{}/p{}/{}/p{}_{}_{}_netlist_gen.py".format(model_dir, task_id, it, task_id, it, code_id)
-                fwrite_code_netlist = open(code_netlist_path, 'w')
+                fwrite_code_netlist = open(code_netlist_path, 'w', encoding="utf-8")
                 fwrite_code_netlist.write(code_netlist)
                 fwrite_code_netlist.close()
                 
@@ -1011,7 +1068,7 @@ def work(task, input, output, task_id, it, background, task_type, flog,
                     if task_type == "Opamp":
                         dc_sweep_code = connect_vinn_vinp(dc_sweep_code, vinn_name, vinp_name)
                     dc_sweep_code += dc_sweep_template.replace("[IN_NAME]", vinn_name).replace("[DC_PATH]", dc_file_path)
-                    fwrite_dc_sweep_code = open(dc_sweep_code_path, 'w')
+                    fwrite_dc_sweep_code = open(dc_sweep_code_path, 'w', encoding='utf-8')
                     fwrite_dc_sweep_code.write(dc_sweep_code)
                     fwrite_dc_sweep_code.close()
                     try:
@@ -1072,9 +1129,10 @@ def work(task, input, output, task_id, it, background, task_type, flog,
                         if any(model in args.model for model in opensource_models):
                             flog.write("task:{}\tit:{}\tcode_id:{}\tsuccess.\tcompletion_tokens:{}"
                                         "\tprompt_tokens:{}\ttotal_tokens:{}\n".format(task_id, it, code_id,
-                                        completion.usage.completion_tokens,
-                                        completion.usage.prompt_tokens,
-                                        completion.usage.total_tokens))
+                                        0, 0, 0))
+                                        #completion.usage.completion_tokens,
+                                        #completion.usage.prompt_tokens,
+                                        #completion.usage.total_tokens))
                             flog.write("total_tokens\t{}\ttotal_prompt_tokens\t{}\ttotal_completion_tokens\t{}\n".format(total_tokens, total_prompt_tokens, total_completion_tokens))
                             ftmp_write = open(f'{model_dir}/p{task_id}/{it}/token_info_{total_tokens}_{total_prompt_tokens}_{total_completion_tokens}_{code_id}', 'w')
                             ftmp_write.close()
@@ -1169,10 +1227,13 @@ def work(task, input, output, task_id, it, background, task_type, flog,
         retry = True
         while retry:
             try:
-                if any(model in args.model for model in opensource_models):
+                if isOllama :
                     print(f"start {args.model} completion")
-                    signal.signal(signal.SIGALRM, signal_handler)
-                    signal.alarm(360)
+                    #signal.signal(signal.SIGALRM, signal_handler)
+                    #signal.alarm(360)
+                    # タイマー開始
+                    timer = threading.Timer(360, timeout_handler)
+                    timer.start()
                     try:
                         completion = ollama.chat(
                             model=args.model,
@@ -1182,12 +1243,15 @@ def work(task, input, output, task_id, it, background, task_type, flog,
                                 "top_p": 1.0,
                             })
                         print(f"{args.model} completion finish")
-                        signal.alarm(0)
+                        #signal.alarm(0)
+                        timer.cancel()
                         break
                     except TimeoutException as e:
+                    #except ollama.ResponseError as e:
                         print(e)
                         print("timeout")
-                        signal.alarm(0)
+                        #signal.alarm(0)
+                        timer.cancel()
                         print("restart ollama")
                         kill_tmux_session("ollama")
                         result = subprocess.run(['ollama', 'restart'], capture_output=True, text=True)
@@ -1200,6 +1264,8 @@ def work(task, input, output, task_id, it, background, task_type, flog,
                         temperature = args.temperature
                     )
                     break
+            except json.JSONDecodeError as e:
+                print("Failed to decode JSON due to:", e)
             except openai.APIStatusError as e:
                 print("Encountered an APIStatusError. Details:")
                 print(e)
@@ -1222,7 +1288,7 @@ def work(task, input, output, task_id, it, background, task_type, flog,
         fwrite_input.write(new_prompt)
         fwrite_input.flush()
 
-        if "gpt" in args.model or "deepseek-chat" in args.model:
+        if not isOllama:
             answer = completion.choices[0].message.content
         else:
             answer = completion['message']['content']
@@ -1251,7 +1317,7 @@ def work(task, input, output, task_id, it, background, task_type, flog,
                 code = "import math\n" + code
     
     # save messages
-    fwrite = open('{}/p{}/{}/p{}_{}_messages.txt'.format(model_dir, task_id, it, task_id, it), 'w')
+    fwrite = open('{}/p{}/{}/p{}_{}_messages.txt'.format(model_dir, task_id, it, task_id, it), 'w', encoding='utf-8')
     fwrite.write(str(messages))
     fwrite.close()
     fwrite_input.close()
@@ -1302,6 +1368,7 @@ def main():
     df = pd.read_csv(data_path, delimiter='\t')
     # print(df)
     # set money cost to $2
+    model_dir = str(args.model).replace(":", "-").replace("/", "-")
     remaining_money = 2
     for index, row in df.iterrows():
         circuit_id = row['Id']
@@ -1309,17 +1376,17 @@ def main():
             continue
         strftime = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
         if args.ngspice:
-            flog = open('{}_{}_{}_ngspice_log.txt'.format(strftime, args.model, circuit_id), 'w')
+            flog = open('{}_{}_{}_ngspice_log.txt'.format(strftime, model_dir, circuit_id), 'w')
         elif args.no_prompt:
-            flog = open('{}_{}_{}_no_prompt_log.txt'.format(strftime, args.model, circuit_id), 'w')
+            flog = open('{}_{}_{}_no_prompt_log.txt'.format(strftime, model_dir, circuit_id), 'w')
         elif args.no_context:
-            flog = open('{}_{}_{}_no_context_log.txt'.format(strftime, args.model, circuit_id), 'w')
+            flog = open('{}_{}_{}_no_context_log.txt'.format(strftime, model_dir, circuit_id), 'w')
         elif args.no_chain:
-            flog = open('{}_{}_{}_no_chain_log.txt'.format(strftime, args.model, circuit_id), 'w')
+            flog = open('{}_{}_{}_no_chain_log.txt'.format(strftime, model_dir, circuit_id), 'w')
         elif not args.skill and row['Type'] in complex_task_type:
-            flog = open('{}_{}_{}_log_no_skill.txt'.format(strftime, args.model, circuit_id), 'w')
+            flog = open('{}_{}_{}_log_no_skill.txt'.format(strftime, model_dir, circuit_id), 'w')
         else:
-            flog = open('{}_{}_{}_log.txt'.format(strftime, args.model, circuit_id), 'w')
+            flog = open('{}_{}_{}_log.txt'.format(strftime, model_dir, circuit_id), 'w')
         for it in range(args.num_of_done, args.num_per_task):
             flog.write("task: {}, it: {}\n".format(circuit_id, it))
             flog.flush()
